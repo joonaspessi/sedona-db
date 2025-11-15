@@ -124,9 +124,8 @@ fn invoke_batch_impl(
     arg_types: &[SedonaType],
     args: &[ColumnarValue],
     max_vertices: i32,
-    _grid_size: f64,
+    grid_size: f64,
 ) -> Result<ColumnarValue> {
-    // TODO: grid_size will be used in Phase 3 for precision grid snapping
 
     // Validate: must be >= 5 (PostGIS line 2630-2634)
     if max_vertices < MIN_MAX_VERTICES {
@@ -159,6 +158,7 @@ fn invoke_batch_impl(
                     max_vertices,
                     0, // initial depth (PostGIS startdepth = 0)
                     &mut results,
+                    grid_size,
                 )?;
 
                 // Create GeometryCollection from results (PostGIS line 2625-2637)
@@ -263,14 +263,85 @@ fn is_collection_not_multipoint(geom: &geos::Geometry) -> Result<bool> {
 /// Find optimal pivot coordinate in a polygon for subdivision
 /// PostGIS lines 2526-2567: lwgeom_locate_between_m
 fn find_optimal_pivot_in_polygon(
-    _poly: &geos::Geometry,
-    _split_ordinate_is_x: bool,
-    _center: f64,
-    _nvertices: usize,
+    poly: &geos::Geometry,
+    split_ordinate_is_x: bool,
+    center: f64,
+    nvertices: usize,
 ) -> Result<f64> {
-    // TODO: This will be implemented when needed in Phase 3
-    // For now, just use the center value
-    Ok(_center)
+    // If there are more points in holes than in outer ring, trim holes starting from biggest
+    let mut ring_to_use = 0; // 0 = exterior ring
+    let mut ring_area = 0.0;
+
+    // Get exterior ring
+    let exterior_ring = poly
+        .get_exterior_ring()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let exterior_ring_points = exterior_ring
+        .get_num_coordinates()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    // Check if we have more vertices in holes than in outer ring
+    if nvertices >= 2 * (exterior_ring_points as usize) {
+        // Find the largest hole by area
+        let num_holes = poly
+            .get_num_interior_rings()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        for i in 0..num_holes {
+            let hole = poly
+                .get_interior_ring_n(i as u32)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let hole_area = hole
+                .area()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                .abs();
+
+            if hole_area >= ring_area {
+                ring_area = hole_area;
+                ring_to_use = (i + 1) as usize; // interior rings are 1-indexed in our usage
+            }
+        }
+    }
+
+    // Get the chosen ring
+    let chosen_ring = if ring_to_use == 0 {
+        exterior_ring
+    } else {
+        poly.get_interior_ring_n((ring_to_use - 1) as u32)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+    };
+
+    // Get coordinate sequence from the ring
+    // Note: LinearRing geometries use coordinate sequences, not point-by-point access
+    let coord_seq = chosen_ring
+        .get_coord_seq()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let num_points = coord_seq
+        .size()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    // Find the point in the ring that is closest to the center on the split axis
+    let mut pivot = f64::MAX;
+    let mut pivot_eps = f64::MAX;
+
+    for i in 0..num_points {
+        let pt = if split_ordinate_is_x {
+            coord_seq.get_x(i)
+        } else {
+            coord_seq.get_y(i)
+        }
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let pt_eps = (pt - center).abs();
+        if pt_eps < pivot_eps {
+            pivot = pt;
+            pivot_eps = pt_eps;
+        }
+    }
+
+    Ok(pivot)
 }
 
 // ========== Phase 3: Core Recursive Subdivision ==========
@@ -283,6 +354,7 @@ fn subdivide_recursive(
     max_vertices: i32,
     depth: i32,
     results: &mut Vec<geos::Geometry>,
+    grid_size: f64,
 ) -> Result<()> {
     // 1. Get bounding box (PostGIS line 2450-2452)
     let (mut xmin, mut ymin, mut xmax, mut ymax) = match get_envelope_bounds(geom) {
@@ -329,7 +401,7 @@ fn subdivide_recursive(
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             // Convert ConstGeometry to Geometry
             let owned_geom = Geom::clone(&sub_geom);
-            subdivide_recursive(&owned_geom, dimension, max_vertices, depth, results)?;
+            subdivide_recursive(&owned_geom, dimension, max_vertices, depth, results, grid_size)?;
         }
         return Ok(());
     }
@@ -396,10 +468,9 @@ fn subdivide_recursive(
     }
 
     // Split the boxes (PostGIS lines 2575-2588)
-    const FP_EPSILON: f64 = 1e-9;
+    // FP_NEQUALS(A, B) = fabs((A)-(B)) > FP_TOLERANCE
     if split_ordinate_is_x {
-        // Check FP_NEQUALS: not equals within epsilon
-        if (subbox1_xmax - pivot).abs() > FP_EPSILON && (subbox1_xmin - pivot).abs() > FP_EPSILON
+        if (subbox1_xmax - pivot).abs() > FP_TOLERANCE && (subbox1_xmin - pivot).abs() > FP_TOLERANCE
         {
             subbox1_xmax = pivot;
             subbox2_xmin = pivot;
@@ -408,7 +479,7 @@ fn subdivide_recursive(
             subbox2_xmin = center;
         }
     } else {
-        if (subbox1_ymax - pivot).abs() > FP_EPSILON && (subbox1_ymin - pivot).abs() > FP_EPSILON
+        if (subbox1_ymax - pivot).abs() > FP_TOLERANCE && (subbox1_ymin - pivot).abs() > FP_TOLERANCE
         {
             subbox1_ymax = pivot;
             subbox2_ymin = pivot;
@@ -423,9 +494,16 @@ fn subdivide_recursive(
     // 11. Clip and recurse into first subbox (PostGIS lines 2592-2603)
     {
         let subbox = create_box_geometry(subbox1_xmin, subbox1_ymin, subbox1_xmax, subbox1_ymax)?;
-        let clipped = geom
+        let mut clipped = geom
             .intersection(&subbox)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Apply precision if grid_size >= 0 (PostGIS line 2595: lwgeom_intersection_prec)
+        if grid_size >= 0.0 {
+            clipped = clipped
+                .set_precision(grid_size, geos::Precision::NoTopo)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
 
         // Simplify with tolerance 0.0 (PostGIS line 2596)
         let simplified = clipped
@@ -436,16 +514,23 @@ fn subdivide_recursive(
             .is_empty()
             .map_err(|e| DataFusionError::External(Box::new(e)))?
         {
-            subdivide_recursive(&simplified, dimension, max_vertices, new_depth, results)?;
+            subdivide_recursive(&simplified, dimension, max_vertices, new_depth, results, grid_size)?;
         }
     }
 
     // 12. Clip and recurse into second subbox (PostGIS lines 2604-2615)
     {
         let subbox = create_box_geometry(subbox2_xmin, subbox2_ymin, subbox2_xmax, subbox2_ymax)?;
-        let clipped = geom
+        let mut clipped = geom
             .intersection(&subbox)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Apply precision if grid_size >= 0 (PostGIS line 2607: lwgeom_intersection_prec)
+        if grid_size >= 0.0 {
+            clipped = clipped
+                .set_precision(grid_size, geos::Precision::NoTopo)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
 
         // Simplify with tolerance 0.0 (PostGIS line 2608)
         let simplified = clipped
@@ -456,7 +541,7 @@ fn subdivide_recursive(
             .is_empty()
             .map_err(|e| DataFusionError::External(Box::new(e)))?
         {
-            subdivide_recursive(&simplified, dimension, max_vertices, new_depth, results)?;
+            subdivide_recursive(&simplified, dimension, max_vertices, new_depth, results, grid_size)?;
         }
     }
 
@@ -633,32 +718,29 @@ mod tests {
         );
     }
 
-    // TODO: Complex polygon test currently produces 6 parts instead of PostGIS's 5 parts
-    // This is likely due to the simplified find_optimal_pivot_in_polygon implementation
-    // which always returns the center point instead of finding the optimal split point
-    // #[rstest]
-    // fn test_st_subdivide_polygon_complex(
-    //     #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
-    // ) {
-    //     let udf = SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
-    //     let tester = ScalarUdfTester::new(
-    //         udf.into(),
-    //         vec![sedona_type.clone(), SedonaType::Arrow(DataType::Int32)],
-    //     );
-    //
-    //     // PostGIS test case 1: Complex polygon from regress/core/subdivide.sql
-    //     // 28-vertex polygon subdivided with max_vertices=10 should produce 5 parts
-    //     let result = tester
-    //         .invoke_scalar_scalar(
-    //             "POLYGON((132 10,119 23,85 35,68 29,66 28,49 42,32 56,22 64,32 110,40 119,36 150,57 158,75 171,92 182,114 184,132 186,146 178,176 184,179 162,184 141,190 122,190 100,185 79,186 56,186 52,178 34,168 18,147 13,132 10))",
-    //             10
-    //         )
-    //         .unwrap();
-    //     tester.assert_scalar_result_equals(
-    //         result,
-    //         "GEOMETRYCOLLECTION(POLYGON((85 35, 68 29, 66 28, 32 56, 22 64, 29.82608695652174 100, 119 100, 119 23, 85 35)), POLYGON((186 52, 178 34, 168 18, 147 13, 132 10, 119 23, 119 56, 186 56, 186 52)), POLYGON((185 79, 186 56, 119 56, 119 100, 190 100, 185 79)), POLYGON((40 119, 36 150, 57 158, 75 171, 92 182, 114 184, 114 100, 29.82608695652174 100, 32 110, 40 119)), POLYGON((132 186, 146 178, 176 184, 179 162, 184 141, 190 122, 190 100, 114 100, 114 184, 132 186)))"
-    //     );
-    // }
+    #[rstest]
+    fn test_st_subdivide_polygon_complex(
+        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
+    ) {
+        let udf = SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
+        let tester = ScalarUdfTester::new(
+            udf.into(),
+            vec![sedona_type.clone(), SedonaType::Arrow(DataType::Int32)],
+        );
+
+        // PostGIS test case 1: Complex polygon from regress/core/subdivide.sql
+        // 28-vertex polygon subdivided with max_vertices=10 should produce 5 parts
+        let result = tester
+            .invoke_scalar_scalar(
+                "POLYGON((132 10,119 23,85 35,68 29,66 28,49 42,32 56,22 64,32 110,40 119,36 150,57 158,75 171,92 182,114 184,132 186,146 178,176 184,179 162,184 141,190 122,190 100,185 79,186 56,186 52,178 34,168 18,147 13,132 10))",
+                10
+            )
+            .unwrap();
+        tester.assert_scalar_result_equals(
+            result,
+            "GEOMETRYCOLLECTION(POLYGON((85 35, 68 29, 66 28, 32 56, 22 64, 29.82608695652174 100, 119 100, 119 23, 85 35)), POLYGON((186 52, 178 34, 168 18, 147 13, 132 10, 119 23, 119 56, 186 56, 186 52)), POLYGON((185 79, 186 56, 119 56, 119 100, 190 100, 185 79)), POLYGON((40 119, 36 150, 57 158, 75 171, 92 182, 114 184, 114 100, 29.82608695652174 100, 32 110, 40 119)), POLYGON((132 186, 146 178, 176 184, 179 162, 184 141, 190 122, 190 100, 114 100, 114 184, 132 186)))"
+        );
+    }
 
     // ========== Phase 2 Helper Function Tests ==========
 
