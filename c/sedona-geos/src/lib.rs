@@ -37,5 +37,6 @@ mod st_reverse;
 mod st_simplify;
 mod st_simplifypreservetopology;
 mod st_snap;
+mod st_subdivide;
 mod st_unaryunion;
 pub mod wkb_to_geos;
