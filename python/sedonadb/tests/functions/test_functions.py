@@ -2339,6 +2339,76 @@ def test_st_snap(eng, input, reference, tolerance, expected):
     )
 
 
+@pytest.mark.parametrize("eng", [SedonaDB])
+@pytest.mark.parametrize(
+    ("geom", "max_vertices", "grid_size", "expected"),
+    [
+        (None, 5, None, None),
+        ("POINT EMPTY", 5, None, "GEOMETRYCOLLECTION EMPTY"),
+        ("LINESTRING EMPTY", 5, None, "GEOMETRYCOLLECTION EMPTY"),
+        ("POLYGON EMPTY", 5, None, "GEOMETRYCOLLECTION EMPTY"),
+        ("POINT (0 0)", 5, None, "GEOMETRYCOLLECTION (POINT (0 0))"),
+        (
+            "LINESTRING (0 0, 100 100)",
+            5,
+            None,
+            "GEOMETRYCOLLECTION (LINESTRING (0 0, 100 100))",
+        ),
+        (
+            "POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0))",
+            5,
+            None,
+            "GEOMETRYCOLLECTION (POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0)))",
+        ),
+        (
+            "LINESTRING (0 0, 100 0)",
+            5,
+            None,
+            "GEOMETRYCOLLECTION (LINESTRING (0 0, 100 0))",
+        ),
+        (
+            "LINESTRING (0 0, 0 100)",
+            5,
+            None,
+            "GEOMETRYCOLLECTION (LINESTRING (0 0, 0 100))",
+        ),
+        # 6-vertex polygon subdivided into 2 parts
+        (
+            "POLYGON ((0 0, 100 0, 100 100, 50 100, 0 100, 0 0))",
+            5,
+            None,
+            "GEOMETRYCOLLECTION (POLYGON ((0 0, 0 50, 100 50, 100 0, 0 0)), POLYGON ((100 50, 0 50, 0 100, 100 100, 100 50)))",
+        ),
+        # 6-vertex polygon with grid_size
+        (
+            "POLYGON ((0 0, 100 0, 100 100, 50 100, 0 100, 0 0))",
+            5,
+            10.0,
+            "GEOMETRYCOLLECTION (POLYGON ((0 50, 100 50, 100 0, 0 0, 0 50)), POLYGON ((0 50, 0 100, 100 100, 100 50, 0 50)))",
+        ),
+        # Complex polygon (28 vertices -> 5 parts with max_vertices=10)
+        (
+            "POLYGON ((132 10, 119 23, 85 35, 68 29, 66 28, 49 42, 32 56, 22 64, 32 110, 40 119, 36 150, 57 158, 75 171, 92 182, 114 184, 132 186, 146 178, 176 184, 179 162, 184 141, 190 122, 190 100, 185 79, 186 56, 186 52, 178 34, 168 18, 147 13, 132 10))",
+            10,
+            None,
+            "GEOMETRYCOLLECTION (POLYGON ((85 35, 68 29, 66 28, 32 56, 22 64, 29.82608695652174 100, 119 100, 119 23, 85 35)), POLYGON ((186 52, 178 34, 168 18, 147 13, 132 10, 119 23, 119 56, 186 56, 186 52)), POLYGON ((185 79, 186 56, 119 56, 119 100, 190 100, 185 79)), POLYGON ((40 119, 36 150, 57 158, 75 171, 92 182, 114 184, 114 100, 29.82608695652174 100, 32 110, 40 119)), POLYGON ((132 186, 146 178, 176 184, 179 162, 184 141, 190 122, 190 100, 114 100, 114 184, 132 186)))",
+        ),
+    ],
+)
+def test_st_subdivide(eng, geom, max_vertices, grid_size, expected):
+    eng = eng.create_or_skip()
+    if grid_size is None:
+        eng.assert_query_result(
+            f"SELECT ST_Subdivide({geom_or_null(geom)}, {val_or_null(max_vertices)})",
+            expected,
+        )
+    else:
+        eng.assert_query_result(
+            f"SELECT ST_Subdivide({geom_or_null(geom)}, {val_or_null(max_vertices)}, {val_or_null(grid_size)})",
+            expected,
+        )
+
+
 @pytest.mark.parametrize("eng", [SedonaDB, PostGIS])
 @pytest.mark.parametrize(
     ("geom", "expected"),
