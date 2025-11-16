@@ -22,7 +22,7 @@ use arrow_schema::DataType;
 use datafusion_common::error::Result;
 use datafusion_common::DataFusionError;
 use datafusion_expr::ColumnarValue;
-use geos::Geom;
+use geos::{Geom, GeometryTypes};
 use sedona_expr::scalar_udf::{ScalarKernelRef, SedonaScalarKernel};
 use sedona_geometry::wkb_factory::WKB_MIN_PROBABLE_BYTES;
 use sedona_schema::{
@@ -32,15 +32,13 @@ use sedona_schema::{
 
 use crate::executor::GeosExecutor;
 
-// Constants following PostGIS implementation
 const MAX_DEPTH: i32 = 50;
-const FP_TOLERANCE: f64 = 1e-12; // For degenerate geometry handling
+const FP_TOLERANCE: f64 = 1e-12;
 const MIN_MAX_VERTICES: i32 = 5;
-const DEFAULT_MAX_VERTICES: i32 = 256; // PostGIS default
-const DEFAULT_GRID_SIZE: f64 = -1.0; // No grid snapping by default (lwgeom_dump.c:343)
+const DEFAULT_MAX_VERTICES: i32 = 256;
+const DEFAULT_GRID_SIZE: f64 = -1.0;
 
 /// ST_Subdivide() implementation using the geos crate
-/// Follows PostGIS implementation exactly (lwgeom.c:2430-2645)
 pub fn st_subdivide_impl() -> ScalarKernelRef {
     Arc::new(STSubdivide {})
 }
@@ -126,8 +124,6 @@ fn invoke_batch_impl(
     max_vertices: i32,
     grid_size: f64,
 ) -> Result<ColumnarValue> {
-
-    // Validate: must be >= 5 (PostGIS line 2630-2634)
     if max_vertices < MIN_MAX_VERTICES {
         return Err(DataFusionError::Execution(format!(
             "max_vertices must be >= {}",
@@ -150,18 +146,16 @@ fn invoke_batch_impl(
                     .get_num_dimensions()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                // Subdivide recursively, accumulating results
                 let mut results = Vec::new();
                 subdivide_recursive(
                     &geom,
-                    dimension as i32,
+                    dimension.try_into().unwrap_or(2), // Safe: geometry dimensions are always small (0-3)
                     max_vertices,
-                    0, // initial depth (PostGIS startdepth = 0)
+                    0,
                     &mut results,
                     grid_size,
                 )?;
 
-                // Create GeometryCollection from results (PostGIS line 2625-2637)
                 let collection = if results.is_empty() {
                     geos::Geometry::create_empty_collection(geos::GeometryTypes::GeometryCollection)
                         .map_err(|e| DataFusionError::External(Box::new(e)))?
@@ -170,7 +164,6 @@ fn invoke_batch_impl(
                         .map_err(|e| DataFusionError::External(Box::new(e)))?
                 };
 
-                // Write to WKB
                 let wkb = collection.to_wkb().map_err(|e| {
                     DataFusionError::Execution(format!("Failed to convert to WKB: {}", e))
                 })?;
@@ -212,11 +205,7 @@ fn extract_scalar_f64(arg: Option<&ColumnarValue>) -> Result<Option<f64>> {
     }
 }
 
-// ========== Phase 2: Helper Functions ==========
-
 /// Get envelope bounds (xmin, ymin, xmax, ymax) from a geometry
-/// PostGIS equivalent: lwgeom_get_bbox returning GBOX
-/// Uses GEOS get_x_min/max and get_y_min/max functions directly
 fn get_envelope_bounds(geom: &geos::Geometry) -> Result<(f64, f64, f64, f64)> {
     let xmin = geom
         .get_x_min()
@@ -236,22 +225,31 @@ fn get_envelope_bounds(geom: &geos::Geometry) -> Result<(f64, f64, f64, f64)> {
 
 /// Create a rectangular box geometry for clipping
 /// PostGIS equivalent: lwpoly_construct_envelope
+/// Note: GEOS 3.11+ has GEOSGeom_createRectangle_r, but we use v3_10_0 for compatibility
 fn create_box_geometry(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Result<geos::Geometry> {
-    // Create WKT for a rectangular polygon
-    let wkt = format!(
-        "POLYGON(({} {}, {} {}, {} {}, {} {}, {} {}))",
-        xmin, ymin, xmax, ymin, xmax, ymax, xmin, ymax, xmin, ymin
-    );
+    // Create coordinate sequence for rectangle (5 points: close the ring)
+    let coords = geos::CoordSeq::new_from_vec(&[
+        [xmin, ymin],
+        [xmax, ymin],
+        [xmax, ymax],
+        [xmin, ymax],
+        [xmin, ymin],
+    ])
+    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-    geos::Geometry::new_from_wkt(&wkt).map_err(|e| DataFusionError::External(Box::new(e)))
+    // Create linear ring from coordinates
+    let ring = geos::Geometry::create_linear_ring(coords)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    // Create polygon from ring (no holes)
+    geos::Geometry::create_polygon(ring, vec![]).map_err(|e| DataFusionError::External(Box::new(e)))
 }
 
 /// Check if geometry is a collection but NOT a MultiPoint
 /// PostGIS: lwgeom_is_collection(geom) && geom->type != MULTIPOINTTYPE
-fn is_collection_not_multipoint(geom: &geos::Geometry) -> Result<bool> {
+fn is_collection(geom: &geos::Geometry) -> Result<bool> {
     let geom_type = geom.geometry_type();
 
-    use geos::GeometryTypes;
     Ok(matches!(
         geom_type,
         GeometryTypes::GeometryCollection
@@ -390,7 +388,7 @@ fn subdivide_recursive(
     }
 
     // 3. Handle collections - recurse into them without incrementing depth (PostGIS lines 2484-2493)
-    if is_collection_not_multipoint(geom)? {
+    if is_collection(geom)? {
         let num_geoms = geom
             .get_num_geometries()
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -401,15 +399,24 @@ fn subdivide_recursive(
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             // Convert ConstGeometry to Geometry
             let owned_geom = Geom::clone(&sub_geom);
-            subdivide_recursive(&owned_geom, dimension, max_vertices, depth, results, grid_size)?;
+            subdivide_recursive(
+                &owned_geom,
+                dimension,
+                max_vertices,
+                depth,
+                results,
+                grid_size,
+            )?;
         }
         return Ok(());
     }
 
     // 4. Filter by dimension (PostGIS lines 2495-2500)
-    let geom_dimension = geom
+    let geom_dimension: i32 = geom
         .get_num_dimensions()
-        .map_err(|e| DataFusionError::External(Box::new(e)))? as i32;
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .try_into()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
     if geom_dimension < dimension {
         // Lower dimension object from clipping, ignore it
         return Ok(());
@@ -432,7 +439,7 @@ fn subdivide_recursive(
     }
 
     // 7. If under vertex tolerance, add it (PostGIS lines 2516-2521)
-    if nvertices as i32 <= max_vertices {
+    if nvertices <= max_vertices as usize {
         results.push(Geom::clone(geom));
         return Ok(());
     }
@@ -470,7 +477,8 @@ fn subdivide_recursive(
     // Split the boxes (PostGIS lines 2575-2588)
     // FP_NEQUALS(A, B) = fabs((A)-(B)) > FP_TOLERANCE
     if split_ordinate_is_x {
-        if (subbox1_xmax - pivot).abs() > FP_TOLERANCE && (subbox1_xmin - pivot).abs() > FP_TOLERANCE
+        if (subbox1_xmax - pivot).abs() > FP_TOLERANCE
+            && (subbox1_xmin - pivot).abs() > FP_TOLERANCE
         {
             subbox1_xmax = pivot;
             subbox2_xmin = pivot;
@@ -479,7 +487,8 @@ fn subdivide_recursive(
             subbox2_xmin = center;
         }
     } else {
-        if (subbox1_ymax - pivot).abs() > FP_TOLERANCE && (subbox1_ymin - pivot).abs() > FP_TOLERANCE
+        if (subbox1_ymax - pivot).abs() > FP_TOLERANCE
+            && (subbox1_ymin - pivot).abs() > FP_TOLERANCE
         {
             subbox1_ymax = pivot;
             subbox2_ymin = pivot;
@@ -514,7 +523,14 @@ fn subdivide_recursive(
             .is_empty()
             .map_err(|e| DataFusionError::External(Box::new(e)))?
         {
-            subdivide_recursive(&simplified, dimension, max_vertices, new_depth, results, grid_size)?;
+            subdivide_recursive(
+                &simplified,
+                dimension,
+                max_vertices,
+                new_depth,
+                results,
+                grid_size,
+            )?;
         }
     }
 
@@ -541,7 +557,14 @@ fn subdivide_recursive(
             .is_empty()
             .map_err(|e| DataFusionError::External(Box::new(e)))?
         {
-            subdivide_recursive(&simplified, dimension, max_vertices, new_depth, results, grid_size)?;
+            subdivide_recursive(
+                &simplified,
+                dimension,
+                max_vertices,
+                new_depth,
+                results,
+                grid_size,
+            )?;
         }
     }
 
@@ -596,9 +619,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Test: NULL geometry should return NULL
-        let result = tester
-            .invoke_scalar_scalar(ScalarValue::Null, 10)
-            .unwrap();
+        let result = tester.invoke_scalar_scalar(ScalarValue::Null, 10).unwrap();
         assert!(result.is_null());
     }
 
@@ -646,10 +667,9 @@ mod tests {
     // Test cases based on PostGIS regress/core/subdivide.sql
 
     #[rstest]
-    fn test_st_subdivide_point(
-        #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
-    ) {
-        let udf = SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
+    fn test_st_subdivide_point(#[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType) {
+        let udf =
+            SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
         let tester = ScalarUdfTester::new(
             udf.into(),
             vec![sedona_type.clone(), SedonaType::Arrow(DataType::Int32)],
@@ -664,7 +684,8 @@ mod tests {
     fn test_st_subdivide_linestring_no_subdivision(
         #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
     ) {
-        let udf = SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
+        let udf =
+            SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
         let tester = ScalarUdfTester::new(
             udf.into(),
             vec![sedona_type.clone(), SedonaType::Arrow(DataType::Int32)],
@@ -674,14 +695,18 @@ mod tests {
         let result = tester
             .invoke_scalar_scalar("LINESTRING(0 0, 10 0, 10 10, 0 10)", 10)
             .unwrap();
-        tester.assert_scalar_result_equals(result, "GEOMETRYCOLLECTION(LINESTRING(0 0, 10 0, 10 10, 0 10))");
+        tester.assert_scalar_result_equals(
+            result,
+            "GEOMETRYCOLLECTION(LINESTRING(0 0, 10 0, 10 10, 0 10))",
+        );
     }
 
     #[rstest]
     fn test_st_subdivide_polygon_simple(
         #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
     ) {
-        let udf = SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
+        let udf =
+            SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
         let tester = ScalarUdfTester::new(
             udf.into(),
             vec![sedona_type.clone(), SedonaType::Arrow(DataType::Int32)],
@@ -691,14 +716,18 @@ mod tests {
         let result = tester
             .invoke_scalar_scalar("POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))", 10)
             .unwrap();
-        tester.assert_scalar_result_equals(result, "GEOMETRYCOLLECTION(POLYGON((0 0, 10 0, 10 10, 0 10, 0 0)))");
+        tester.assert_scalar_result_equals(
+            result,
+            "GEOMETRYCOLLECTION(POLYGON((0 0, 10 0, 10 10, 0 10, 0 0)))",
+        );
     }
 
     #[rstest]
     fn test_st_subdivide_polygon_many_vertices(
         #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
     ) {
-        let udf = SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
+        let udf =
+            SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
         let tester = ScalarUdfTester::new(
             udf.into(),
             vec![sedona_type.clone(), SedonaType::Arrow(DataType::Int32)],
@@ -722,7 +751,8 @@ mod tests {
     fn test_st_subdivide_polygon_complex(
         #[values(WKB_GEOMETRY, WKB_VIEW_GEOMETRY)] sedona_type: SedonaType,
     ) {
-        let udf = SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
+        let udf =
+            SedonaScalarUDF::from_kernel("st_subdivide", st_subdivide_with_max_vertices_impl());
         let tester = ScalarUdfTester::new(
             udf.into(),
             vec![sedona_type.clone(), SedonaType::Arrow(DataType::Int32)],
@@ -794,30 +824,30 @@ mod tests {
         let gc =
             geos::Geometry::new_from_wkt("GEOMETRYCOLLECTION(POINT(0 0), LINESTRING(0 0, 1 1))")
                 .unwrap();
-        assert!(is_collection_not_multipoint(&gc).unwrap());
+        assert!(is_collection(&gc).unwrap());
 
         // MultiLineString should return true
         let mls = geos::Geometry::new_from_wkt("MULTILINESTRING((0 0, 1 1), (2 2, 3 3))").unwrap();
-        assert!(is_collection_not_multipoint(&mls).unwrap());
+        assert!(is_collection(&mls).unwrap());
 
         // MultiPolygon should return true
         let mp = geos::Geometry::new_from_wkt("MULTIPOLYGON(((0 0, 1 0, 1 1, 0 1, 0 0)))").unwrap();
-        assert!(is_collection_not_multipoint(&mp).unwrap());
+        assert!(is_collection(&mp).unwrap());
 
         // MultiPoint should return false
         let multipoint = geos::Geometry::new_from_wkt("MULTIPOINT(0 0, 1 1)").unwrap();
-        assert!(!is_collection_not_multipoint(&multipoint).unwrap());
+        assert!(!is_collection(&multipoint).unwrap());
 
         // Point should return false
         let point = geos::Geometry::new_from_wkt("POINT(0 0)").unwrap();
-        assert!(!is_collection_not_multipoint(&point).unwrap());
+        assert!(!is_collection(&point).unwrap());
 
         // LineString should return false
         let linestring = geos::Geometry::new_from_wkt("LINESTRING(0 0, 1 1)").unwrap();
-        assert!(!is_collection_not_multipoint(&linestring).unwrap());
+        assert!(!is_collection(&linestring).unwrap());
 
         // Polygon should return false
         let polygon = geos::Geometry::new_from_wkt("POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))").unwrap();
-        assert!(!is_collection_not_multipoint(&polygon).unwrap());
+        assert!(!is_collection(&polygon).unwrap());
     }
 }
